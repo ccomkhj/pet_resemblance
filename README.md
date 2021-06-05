@@ -27,21 +27,10 @@ Save images in ImageFolder way.
 
 ## run the network ##
 
-1. change the `data_dir` (line 17) to the path of datasets
-2. change test image: `image_file` (line 67)
+1. change the `data_dir` to the path of datasets
+2. change test image: `image_file`
 3. run it: `python animals-classification.py`
 
 
-## result ##
-
-### test image show
-
-![image show](./images/cnn_01.jpg)
-
-### the result
-
-![result](./images/cnn_02.jpg)
-
-
 ## Author ##
-Feel free to contact me if you have any questions: xpzouying@gmail.com
+Feel free to contact me if you have any questions: huijo.kim@rwth-aachen.de
