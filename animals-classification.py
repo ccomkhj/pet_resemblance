@@ -13,7 +13,6 @@ from torchvision.datasets import ImageFolder
 import matplotlib.pyplot as plt
 from PIL import Image
 
-
 parser = argparse.ArgumentParser(description='animal classification')
 parser.add_argument('--dir', required=True, type=str,
                     help='the root of image data directory')
@@ -34,12 +33,14 @@ train_transform= transforms.Compose([
 
 # ImageFolder: https://github.com/pytorch/vision#imagefolder
 tset = ImageFolder(data_dir, transform=train_transform)
-train_dataloader = DataLoader(tset, batch_size=4, shuffle=True)
+train_dataloader = DataLoader(tset, batch_size=2, shuffle=True)
 num_classes = len(set(tset.classes))
 
 # use pretrained resnet18 network: image input: (512, 512)
 model = torchvision.models.resnet18(pretrained=True)
 model.fc = torch.nn.Linear(2048, num_classes)
+
+
 
 # run in cuda
 if torch.cuda.is_available():
@@ -76,8 +77,9 @@ for inputs, labels in train_dataloader:
 image_file = args.test_img
 
 # if want to show image file, run the following
-# img_show_1 = plt.imread(image_file)
-# plt.imshow(img_show_1)
+img_show_1 = plt.imread(image_file)
+plt.imshow(img_show_1)
+plt.show()
 
 img2 = Image.open(image_file)
 img2 = train_transform(img2)
