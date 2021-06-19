@@ -1,102 +1,297 @@
 # coding: utf-8
-
-import os
-import argparse
-
+from __future__ import print_function
+from __future__ import division
 import torch
 import torch.nn as nn
-from torch.autograd import Variable
+import torch.optim as optim
+import numpy as np
 import torchvision
-from torch.utils.data import DataLoader
-from torchvision import transforms
-from torchvision.datasets import ImageFolder
+from torchvision import datasets, models, transforms
 import matplotlib.pyplot as plt
+import time
+import os
+import copy
+print("PyTorch Version: ",torch.__version__)
+print("Torchvision Version: ",torchvision.__version__)
+import argparse
+from torch.autograd import Variable
+from torch.utils.data import DataLoader
 from PIL import Image
+
+import streamlit as st
+
+st.title('Pet Resemblance App')
 
 parser = argparse.ArgumentParser(description='animal classification')
 parser.add_argument('--dir', required=True, type=str,
                     help='the root of image data directory')
 parser.add_argument('--test_img', required=True, type=str,
                     help='test image')
+parser.add_argument('--save_mode', required=False, default=False,
+                    help='save weight')        
+parser.add_argument('--check_point', required=False, default='check_point',
+                    help='the root of image data directory')            
 
 args = parser.parse_args()
 
 # dataset path
 data_dir = args.dir
 data_dir = os.path.expanduser(data_dir)
+save_mode = args.save_mode
+check_point = args.check_point
 
-# dataset pre-process
-train_transform= transforms.Compose([
-    transforms.Scale([512, 512]),
-    transforms.ToTensor(),
-])
-
-# ImageFolder: https://github.com/pytorch/vision#imagefolder
-tset = ImageFolder(data_dir, transform=train_transform)
-train_dataloader = DataLoader(tset, batch_size=2, shuffle=True)
-num_classes = len(set(tset.classes))
-
-# use pretrained resnet18 network: image input: (512, 512)
-model = torchvision.models.resnet18(pretrained=True)
-model.fc = torch.nn.Linear(2048, num_classes)
+# Models to choose from [resnet, alexnet, vgg, squeezenet, densenet, inception]
+model_name = "resnet"
+num_classes = 2 # Number of classes in the dataset
+batch_size = 2 # Batch size for training (change depending on how much memory you have)
+num_epochs = 3 # Number of epochs to train for
+feature_extract = True # Flag for feature extracting. When False, we finetune the whole model, when True we only update the reshaped layer params
 
 
+def train_model(model, dataloaders, criterion, optimizer, num_epochs=25, is_inception=False):
+    since = time.time()
 
-# run in cuda
-if torch.cuda.is_available():
-    model = model.cuda()
-print(model)
+    val_acc_history = []
 
-# optimizer
-optimizer = torch.optim.SGD(model.parameters(), lr=0.001, momentum=0.9)
-# loss function
-loss_fn = nn.CrossEntropyLoss()
+    best_model_wts = copy.deepcopy(model.state_dict())
+    best_acc = 0.0
 
-# begin to train models
-model.train()
-for inputs, labels in train_dataloader:
-    if torch.cuda.is_available():
-        # use cuda
-        inputs = Variable(inputs.cuda())
-        labels = Variable(labels.cuda())
+    for epoch in range(num_epochs):
+        print('Epoch {}/{}'.format(epoch, num_epochs - 1))
+        print('-' * 10)
+
+        # Each epoch has a training and validation phase
+        for phase in ['train', 'val']:
+            if phase == 'train':
+                model.train()  # Set model to training mode
+            else:
+                model.eval()   # Set model to evaluate mode
+
+            running_loss = 0.0
+            running_corrects = 0
+
+            # Iterate over data.
+            for inputs, labels in dataloaders[phase]:
+                inputs = inputs.to(device)
+                labels = labels.to(device)
+
+                # zero the parameter gradients
+                optimizer.zero_grad()
+
+                # forward
+                # track history if only in train
+                with torch.set_grad_enabled(phase == 'train'):
+                    # Get model outputs and calculate loss
+                    # Special case for inception because in training it has an auxiliary output. In train
+                    #   mode we calculate the loss by summing the final output and the auxiliary output
+                    #   but in testing we only consider the final output.
+                    if is_inception and phase == 'train':
+                        # From https://discuss.pytorch.org/t/how-to-optimize-inception-model-with-auxiliary-classifiers/7958
+                        outputs, aux_outputs = model(inputs)
+                        loss1 = criterion(outputs, labels)
+                        loss2 = criterion(aux_outputs, labels)
+                        loss = loss1 + 0.4*loss2
+                    else:
+                        outputs = model(inputs)
+                        loss = criterion(outputs, labels)
+
+                    _, preds = torch.max(outputs, 1)
+
+                    # backward + optimize only if in training phase
+                    if phase == 'train':
+                        loss.backward()
+                        optimizer.step()
+
+                # statistics
+                running_loss += loss.item() * inputs.size(0)
+                running_corrects += torch.sum(preds == labels.data)
+
+            epoch_loss = running_loss / len(dataloaders[phase].dataset)
+            epoch_acc = running_corrects.double() / len(dataloaders[phase].dataset)
+
+            print('{} Loss: {:.4f} Acc: {:.4f}'.format(phase, epoch_loss, epoch_acc))
+
+            # deep copy the model
+            if phase == 'val' and epoch_acc > best_acc:
+                best_acc = epoch_acc
+                best_model_wts = copy.deepcopy(model.state_dict())
+            if phase == 'val':
+                val_acc_history.append(epoch_acc)
+
+        print()
+
+    time_elapsed = time.time() - since
+    print('Training complete in {:.0f}m {:.0f}s'.format(time_elapsed // 60, time_elapsed % 60))
+    print('Best val Acc: {:4f}'.format(best_acc))
+
+    # load best model weights
+    model.load_state_dict(best_model_wts)
+    return model, val_acc_history
+
+def set_parameter_requires_grad(model, feature_extracting):
+    if feature_extracting:
+        for param in model.parameters():
+            param.requires_grad = False
+
+def initialize_model(model_name, num_classes, feature_extract, use_pretrained=True):
+    # Initialize these variables which will be set in this if statement. Each of these
+    #   variables is model specific.
+    model_ft = None
+    input_size = 0
+
+    if model_name == "resnet":
+        """ Resnet18
+        """
+        model_ft = models.resnet18(pretrained=use_pretrained)
+        set_parameter_requires_grad(model_ft, feature_extract)
+        num_ftrs = model_ft.fc.in_features
+        model_ft.fc = nn.Linear(num_ftrs, num_classes)
+        input_size = 224
+
+    elif model_name == "alexnet":
+        """ Alexnet
+        """
+        model_ft = models.alexnet(pretrained=use_pretrained)
+        set_parameter_requires_grad(model_ft, feature_extract)
+        num_ftrs = model_ft.classifier[6].in_features
+        model_ft.classifier[6] = nn.Linear(num_ftrs,num_classes)
+        input_size = 224
+
+    elif model_name == "vgg":
+        """ VGG11_bn
+        """
+        model_ft = models.vgg11_bn(pretrained=use_pretrained)
+        set_parameter_requires_grad(model_ft, feature_extract)
+        num_ftrs = model_ft.classifier[6].in_features
+        model_ft.classifier[6] = nn.Linear(num_ftrs,num_classes)
+        input_size = 224
+
+    elif model_name == "squeezenet":
+        """ Squeezenet
+        """
+        model_ft = models.squeezenet1_0(pretrained=use_pretrained)
+        set_parameter_requires_grad(model_ft, feature_extract)
+        model_ft.classifier[1] = nn.Conv2d(512, num_classes, kernel_size=(1,1), stride=(1,1))
+        model_ft.num_classes = num_classes
+        input_size = 224
+
+    elif model_name == "densenet":
+        """ Densenet
+        """
+        model_ft = models.densenet121(pretrained=use_pretrained)
+        set_parameter_requires_grad(model_ft, feature_extract)
+        num_ftrs = model_ft.classifier.in_features
+        model_ft.classifier = nn.Linear(num_ftrs, num_classes)
+        input_size = 224
+
+    elif model_name == "inception":
+        """ Inception v3
+        Be careful, expects (299,299) sized images and has auxiliary output
+        """
+        model_ft = models.inception_v3(pretrained=use_pretrained)
+        set_parameter_requires_grad(model_ft, feature_extract)
+        # Handle the auxilary net
+        num_ftrs = model_ft.AuxLogits.fc.in_features
+        model_ft.AuxLogits.fc = nn.Linear(num_ftrs, num_classes)
+        # Handle the primary net
+        num_ftrs = model_ft.fc.in_features
+        model_ft.fc = nn.Linear(num_ftrs,num_classes)
+        input_size = 299
+
     else:
-        # use cpu
-        inputs = Variable(inputs)
-        labels = Variable(labels)
+        print("Invalid model name, exiting...")
+        exit()
 
-    # zero the parameter gradients
-    optimizer.zero_grad()
+    return model_ft, input_size
 
-    # forward
-    outputs = model(inputs)
-    loss = loss_fn(outputs, labels)
-    loss.backward()
-    optimizer.step()
+# Initialize the model for this run
+model_ft, input_size = initialize_model(model_name, num_classes, feature_extract, use_pretrained=True)
 
-# begin to test
-image_file = args.test_img
+# Print the model we just instantiated
+print(model_ft)
 
-# if want to show image file, run the following
-img_show_1 = plt.imread(image_file)
-plt.imshow(img_show_1)
-plt.show()
+# Data augmentation and normalization for training
+# Just normalization for validation
+data_transforms = {
+    'train': transforms.Compose([
+        transforms.RandomResizedCrop(input_size),
+        transforms.RandomHorizontalFlip(),
+        transforms.ToTensor(),
+        transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
+    ]),
+    'val': transforms.Compose([
+        transforms.Resize(input_size),
+        transforms.CenterCrop(input_size),
+        transforms.ToTensor(),
+        transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
+    ]),
+}
 
-img2 = Image.open(image_file)
-img2 = train_transform(img2)
-img2 = img2.unsqueeze(0)  # pytorch only accept batch images, so unsqueeze it
-                          # if you meet error shows need 4D, but input is 3D
-                          # try it
+print("Initializing Datasets and Dataloaders...")
 
-img2 = Variable(img2)
-if torch.cuda.is_available():
-    img2 = img2.cuda()
+# Create training and validation datasets
+image_datasets = {x: datasets.ImageFolder(os.path.join(data_dir, x), data_transforms[x]) for x in ['train', 'val']}
+# Create training and validation dataloaders
+dataloaders_dict = {x: torch.utils.data.DataLoader(image_datasets[x], batch_size=batch_size, shuffle=True, num_workers=0) for x in ['train', 'val']}
 
-model.eval()
-target = model(img2)
+# Detect if we have a GPU available
+device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 
-# get the predict classes
-_, pred = torch.max(target.data, 1)
-print('all classes: ', tset.classes)
-print('all classes prop: ', nn.functional.softmax(target))
-print('prediction: ', pred[0], ' classes: ', tset.classes[pred[0]])
+# Send the model to GPU
+model_ft = model_ft.to(device)
+
+date = model_ft.parameters()
+print("Params to learn:")
+if feature_extract:
+    params_to_update = []
+    for name,param in model_ft.named_parameters():
+        if param.requires_grad == True:
+            params_to_update.append(param)
+            print("\t",name)
+else:
+    for name,param in model_ft.named_parameters():
+        if param.requires_grad == True:
+            print("\t",name)
+
+# Observe that all parameters are being optimized
+optimizer_ft = optim.SGD(params_to_update, lr=0.001, momentum=0.9)
+
+# Setup the loss fxn
+criterion = nn.CrossEntropyLoss()
+
+# Train and evaluate
+model_ft, hist = train_model(model_ft, dataloaders_dict, criterion, optimizer_ft, num_epochs=num_epochs)
+
+if save_mode:
+    torch.save(model_ft.state_dict(), check_point)
+
+def test_image(args,model):
+    # begin to test
+    image_file = args.test_img
+    check_point = args.check_point
+
+    # if want to show image file, run the following
+    img_show_1 = plt.imread(image_file)
+    plt.imshow(img_show_1)
+    plt.show()
+
+
+    img2 = Image.open(image_file)
+    img2 = data_transforms['val'](img2)
+    img2 = img2.unsqueeze(0)  # pytorch only accept batch images, so unsqueeze it
+                            # if you meet error shows need 4D, but input is 3D
+                            # try it
+
+    img2 = Variable(img2)
+    if torch.cuda.is_available():
+        img2 = img2.cuda()
+    model.load_state_dict(torch.load(check_point))
+    model.eval()
+    target = model(img2)
+
+    # get the predict classes
+    _, pred = torch.max(target.data, 1)
+    print('all classes: ', image_datasets['train'].classes)
+    print('all classes prop: ', nn.functional.softmax(target))
+    print('prediction: ', pred[0], ' classes: ', image_datasets['train'].classes[pred[0]])
 
