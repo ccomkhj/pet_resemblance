@@ -5,14 +5,11 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 import numpy as np
-import torchvision
 from torchvision import datasets, models, transforms
 import matplotlib.pyplot as plt
 import time
 import os
 import copy
-print("PyTorch Version: ",torch.__version__)
-print("Torchvision Version: ",torchvision.__version__)
 import argparse
 from torch.autograd import Variable
 from torch.utils.data import DataLoader
@@ -22,33 +19,14 @@ import streamlit as st
 
 st.title('Pet Resemblance App')
 
-parser = argparse.ArgumentParser(description='animal classification')
-parser.add_argument('--dir', required=True, type=str,
-                    help='the root of image data directory')
-parser.add_argument('--test_img', required=True, type=str,
-                    help='test image')
-parser.add_argument('--save_mode', required=False, default=False,
-                    help='save weight')        
-parser.add_argument('--check_point', required=False, default='check_point',
-                    help='the root of image data directory')            
+def get_path(args):# dataset path
+    data_dir = args.dir
+    data_dir = os.path.expanduser(data_dir)
+    save_mode = args.save_mode
+    check_point = args.check_point
+    return data_dir, save_mode, check_point
 
-args = parser.parse_args()
-
-# dataset path
-data_dir = args.dir
-data_dir = os.path.expanduser(data_dir)
-save_mode = args.save_mode
-check_point = args.check_point
-
-# Models to choose from [resnet, alexnet, vgg, squeezenet, densenet, inception]
-model_name = "resnet"
-num_classes = 2 # Number of classes in the dataset
-batch_size = 2 # Batch size for training (change depending on how much memory you have)
-num_epochs = 3 # Number of epochs to train for
-feature_extract = True # Flag for feature extracting. When False, we finetune the whole model, when True we only update the reshaped layer params
-
-
-def train_model(model, dataloaders, criterion, optimizer, num_epochs=25, is_inception=False):
+def train_model(model, dataloaders, criterion, optimizer, device, num_epochs=25, is_inception=False ):
     since = time.time()
 
     val_acc_history = []
@@ -204,66 +182,61 @@ def initialize_model(model_name, num_classes, feature_extract, use_pretrained=Tr
 
     return model_ft, input_size
 
-# Initialize the model for this run
-model_ft, input_size = initialize_model(model_name, num_classes, feature_extract, use_pretrained=True)
+def load_data(args):
+    data_dir = args.dir
+    # Data augmentation and normalization for training
+    # Just normalization for validation
+    data_transforms = {
+        'train': transforms.Compose([
+            transforms.RandomResizedCrop(input_size),
+            transforms.RandomHorizontalFlip(),
+            transforms.ToTensor(),
+            transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
+        ]),
+        'val': transforms.Compose([
+            transforms.Resize(input_size),
+            transforms.CenterCrop(input_size),
+            transforms.ToTensor(),
+            transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
+        ]),
+    }
 
-# Print the model we just instantiated
-print(model_ft)
+    print("Initializing Datasets and Dataloaders...")
 
-# Data augmentation and normalization for training
-# Just normalization for validation
-data_transforms = {
-    'train': transforms.Compose([
-        transforms.RandomResizedCrop(input_size),
-        transforms.RandomHorizontalFlip(),
-        transforms.ToTensor(),
-        transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
-    ]),
-    'val': transforms.Compose([
-        transforms.Resize(input_size),
-        transforms.CenterCrop(input_size),
-        transforms.ToTensor(),
-        transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
-    ]),
-}
+    # Create training and validation datasets
+    image_datasets = {x: datasets.ImageFolder(os.path.join(data_dir, x), data_transforms[x]) for x in ['train', 'val']}
+    # Create training and validation dataloaders
+    dataloaders_dict = {x: torch.utils.data.DataLoader(image_datasets[x], batch_size=batch_size, shuffle=True, num_workers=0) for x in ['train', 'val']}
+    return image_datasets, dataloaders_dict
 
-print("Initializing Datasets and Dataloaders...")
+def optimizer(model_ft,device):
+    # Send the model to GPU
+    model_ft = model_ft.to(device)
 
-# Create training and validation datasets
-image_datasets = {x: datasets.ImageFolder(os.path.join(data_dir, x), data_transforms[x]) for x in ['train', 'val']}
-# Create training and validation dataloaders
-dataloaders_dict = {x: torch.utils.data.DataLoader(image_datasets[x], batch_size=batch_size, shuffle=True, num_workers=0) for x in ['train', 'val']}
+    date = model_ft.parameters()
+    print("Params to learn:")
+    if feature_extract:
+        params_to_update = []
+        for name,param in model_ft.named_parameters():
+            if param.requires_grad == True:
+                params_to_update.append(param)
+                print("\t",name)
+    else:
+        for name,param in model_ft.named_parameters():
+            if param.requires_grad == True:
+                print("\t",name)
 
-# Detect if we have a GPU available
-device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+    # Observe that all parameters are being optimized
+    optimizer_ft = optim.SGD(params_to_update, lr=0.001, momentum=0.9)
+    return optimizer_ft
 
-# Send the model to GPU
-model_ft = model_ft.to(device)
+def run(model_ft, optimizer_ft, num_epochs, dataloaders_dict, device):
+    # Setup the loss fxn
+    criterion = nn.CrossEntropyLoss()
 
-date = model_ft.parameters()
-print("Params to learn:")
-if feature_extract:
-    params_to_update = []
-    for name,param in model_ft.named_parameters():
-        if param.requires_grad == True:
-            params_to_update.append(param)
-            print("\t",name)
-else:
-    for name,param in model_ft.named_parameters():
-        if param.requires_grad == True:
-            print("\t",name)
-
-# Observe that all parameters are being optimized
-optimizer_ft = optim.SGD(params_to_update, lr=0.001, momentum=0.9)
-
-# Setup the loss fxn
-criterion = nn.CrossEntropyLoss()
-
-# Train and evaluate
-model_ft, hist = train_model(model_ft, dataloaders_dict, criterion, optimizer_ft, num_epochs=num_epochs)
-
-if save_mode:
-    torch.save(model_ft.state_dict(), check_point)
+    # Train and evaluate
+    model_ft, hist = train_model(model_ft, dataloaders_dict, criterion, optimizer_ft, device,  num_epochs=num_epochs)
+    return model_ft, hist
 
 def test_image(args,model):
     # begin to test
@@ -275,6 +248,20 @@ def test_image(args,model):
     plt.imshow(img_show_1)
     plt.show()
 
+    data_transforms = {
+        'train': transforms.Compose([
+            transforms.RandomResizedCrop(input_size),
+            transforms.RandomHorizontalFlip(),
+            transforms.ToTensor(),
+            transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
+        ]),
+        'val': transforms.Compose([
+            transforms.Resize(input_size),
+            transforms.CenterCrop(input_size),
+            transforms.ToTensor(),
+            transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
+        ]),
+    }
 
     img2 = Image.open(image_file)
     img2 = data_transforms['val'](img2)
@@ -295,3 +282,33 @@ def test_image(args,model):
     print('all classes prop: ', nn.functional.softmax(target))
     print('prediction: ', pred[0], ' classes: ', image_datasets['train'].classes[pred[0]])
 
+def parse_args():
+    parser = argparse.ArgumentParser(description='animal classification')
+    parser.add_argument('--dir', required=True, type=str,
+                        help='the root of image data directory')
+    parser.add_argument('--test_img', required=True, type=str,
+                        help='test image')
+    parser.add_argument('--save_mode', required=False, default=False,
+                        help='save weight')        
+    parser.add_argument('--check_point', required=False, default='check_point',
+                        help='the root of image data directory')            
+    args = parser.parse_args()
+    return args
+
+if __name__ == '__main__':
+
+    # Models to choose from [resnet, alexnet, vgg, squeezenet, densenet, inception]
+    model_name = "resnet"
+    num_classes = 2 # Number of classes in the dataset
+    batch_size = 2 # Batch size for training (change depending on how much memory you have)
+    num_epochs = 3 # Number of epochs to train for
+    feature_extract = True # Flag for feature extracting. When False, we finetune the whole model, when True we only update the reshaped layer params
+
+    # Detect if we have a GPU available
+    device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+    args = parse_args()
+    model_ft, input_size = initialize_model(model_name, num_classes, feature_extract, use_pretrained=True) # Initialize the model for this run
+    # print(model_ft) # Print the model we just instantiated
+    image_datasets, dataloaders_dict = load_data(args)
+    optimizer_ft = optimizer(model_ft,device)
+    model_ft, hist = run(model_ft, optimizer_ft, num_epochs, dataloaders_dict, device)
